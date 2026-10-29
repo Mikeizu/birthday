@@ -8,6 +8,7 @@ import { getWhatsAppStatus } from './whatsapp.js';
 const SESSION_TTL = 12 * 60 * 60 * 1000;
 const LOGIN_WINDOW = 15 * 60 * 1000;
 const COOKIE_NAME = 'impact23_admin';
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 function hashPassword(password) {
   const salt = randomBytes(16).toString('hex');
@@ -43,6 +44,14 @@ function sessionKey(token) {
   return createHash('sha256').update(token).digest('hex');
 }
 
+function sameBirthday(stored, incoming) {
+  return Object.entries(incoming).every(([key, value]) => stored[key] === value);
+}
+
+function validBaseRevision(revision) {
+  return revision === undefined || (Number.isSafeInteger(revision) && revision > 0);
+}
+
 /** Create an isolated app. Call close() when tests or the HTTP server finish. */
 export function createApp({
   databasePath = process.env.DATABASE_PATH || path.resolve('.data/birthdays.sqlite'),
@@ -67,6 +76,7 @@ export function createApp({
       day INTEGER NOT NULL,
       whatsappPhone TEXT NOT NULL DEFAULT '',
       whatsappOptIn INTEGER NOT NULL DEFAULT 0,
+      revision INTEGER NOT NULL DEFAULT 1,
       createdAt TEXT NOT NULL
     );
     CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -74,6 +84,7 @@ export function createApp({
   const columns = new Set(db.prepare('PRAGMA table_info(birthdays)').all().map((column) => column.name));
   if (!columns.has('whatsappPhone')) db.exec("ALTER TABLE birthdays ADD COLUMN whatsappPhone TEXT NOT NULL DEFAULT ''");
   if (!columns.has('whatsappOptIn')) db.exec('ALTER TABLE birthdays ADD COLUMN whatsappOptIn INTEGER NOT NULL DEFAULT 0');
+  if (!columns.has('revision')) db.exec('ALTER TABLE birthdays ADD COLUMN revision INTEGER NOT NULL DEFAULT 1');
   const readBirthday = (row) => ({ ...row, whatsappOptIn: Boolean(row.whatsappOptIn), hasWhatsapp: Boolean(row.whatsappPhone && row.whatsappOptIn) });
   const getBirthdays = () => db.prepare('SELECT * FROM birthdays ORDER BY month, day, name COLLATE NOCASE').all().map(readBirthday);
   let passwordHash = adminPassword ? hashPassword(adminPassword) : db.prepare("SELECT value FROM settings WHERE key = 'admin_password'").get()?.value;
@@ -90,6 +101,10 @@ export function createApp({
     res.set('X-Frame-Options', 'DENY');
     res.set('Referrer-Policy', 'same-origin');
     if (req.path.startsWith('/api/')) res.set('Cache-Control', 'no-store');
+    if (req.path === '/sw.js' || req.path === '/service-worker.js') {
+      res.set('Cache-Control', 'no-store');
+      res.set('Service-Worker-Allowed', '/');
+    }
     next();
   });
   app.use('/api', (req, res, next) => {
@@ -174,22 +189,53 @@ export function createApp({
   app.post('/api/birthdays', requireAdmin, (req, res) => {
     const data = validateBirthday(req.body);
     if (!data) return res.status(400).json({ error: 'Provide a name (up to 100 characters), an optional title, a valid birthday, and an international WhatsApp number if opted in.' });
-    const birthday = { id: randomUUID(), ...data, createdAt: new Date().toISOString() };
-    db.prepare('INSERT INTO birthdays (id, name, title, month, day, whatsappPhone, whatsappOptIn, createdAt) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+    if (req.body.id !== undefined && (typeof req.body.id !== 'string' || !UUID_PATTERN.test(req.body.id))) {
+      return res.status(400).json({ error: 'The birthday record ID must be a valid UUID.' });
+    }
+    const birthday = { id: req.body.id?.toLowerCase() || randomUUID(), ...data, revision: 1, createdAt: new Date().toISOString() };
+    const result = db.prepare('INSERT INTO birthdays (id, name, title, month, day, whatsappPhone, whatsappOptIn, createdAt) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO NOTHING')
       .run(birthday.id, birthday.name, birthday.title, birthday.month, birthday.day, birthday.whatsappPhone, Number(birthday.whatsappOptIn), birthday.createdAt);
+    if (!result.changes) {
+      const existing = readBirthday(db.prepare('SELECT * FROM birthdays WHERE id = ?').get(birthday.id));
+      if (!sameBirthday(existing, data)) {
+        return res.status(409).json({ error: 'A different birthday record already uses this ID. Refresh your records before syncing again.' });
+      }
+      return res.json({ birthday: existing });
+    }
     res.status(201).json({ birthday: { ...birthday, hasWhatsapp: Boolean(birthday.whatsappPhone && birthday.whatsappOptIn) } });
   });
   app.put('/api/birthdays/:id', requireAdmin, (req, res) => {
     const data = validateBirthday(req.body);
     if (!data) return res.status(400).json({ error: 'Provide a name (up to 100 characters), an optional title, a valid birthday, and an international WhatsApp number if opted in.' });
-    const result = db.prepare('UPDATE birthdays SET name = ?, title = ?, month = ?, day = ?, whatsappPhone = ?, whatsappOptIn = ? WHERE id = ?')
-      .run(data.name, data.title, data.month, data.day, data.whatsappPhone, Number(data.whatsappOptIn), req.params.id);
-    if (!result.changes) return res.status(404).json({ error: 'This birthday record could not be found.' });
+    const baseRevision = req.body.baseRevision;
+    if (!validBaseRevision(baseRevision)) return res.status(400).json({ error: 'The base revision must be a positive safe integer.' });
+    const row = db.prepare('SELECT * FROM birthdays WHERE id = ?').get(req.params.id);
+    if (!row) return res.status(404).json({ error: 'This birthday record could not be found.' });
+    const existing = readBirthday(row);
+    // The server may have saved this exact edit before its response was lost.
+    if (sameBirthday(existing, data)) return res.json({ birthday: existing });
+    const result = db.prepare(`UPDATE birthdays SET name = ?, title = ?, month = ?, day = ?, whatsappPhone = ?, whatsappOptIn = ?, revision = revision + 1 WHERE id = ?${baseRevision === undefined ? '' : ' AND revision = ?'}`)
+      .run(data.name, data.title, data.month, data.day, data.whatsappPhone, Number(data.whatsappOptIn), req.params.id, ...(baseRevision === undefined ? [] : [baseRevision]));
+    if (!result.changes) {
+      const current = db.prepare('SELECT * FROM birthdays WHERE id = ?').get(req.params.id);
+      if (!current) return res.status(404).json({ error: 'This birthday record could not be found.' });
+      const birthday = readBirthday(current);
+      if (sameBirthday(birthday, data)) return res.json({ birthday });
+      return res.status(409).json({ error: 'This birthday was changed on another device. Refresh your records before syncing this edit.' });
+    }
     res.json({ birthday: readBirthday(db.prepare('SELECT * FROM birthdays WHERE id = ?').get(req.params.id)) });
   });
   app.delete('/api/birthdays/:id', requireAdmin, (req, res) => {
-    const result = db.prepare('DELETE FROM birthdays WHERE id = ?').run(req.params.id);
-    if (!result.changes) return res.status(404).json({ error: 'This birthday record could not be found.' });
+    const baseRevision = req.body?.baseRevision;
+    if (!validBaseRevision(baseRevision)) return res.status(400).json({ error: 'The base revision must be a positive safe integer.' });
+    const result = db.prepare(`DELETE FROM birthdays WHERE id = ?${baseRevision === undefined ? '' : ' AND revision = ?'}`)
+      .run(req.params.id, ...(baseRevision === undefined ? [] : [baseRevision]));
+    if (!result.changes) {
+      if (db.prepare('SELECT id FROM birthdays WHERE id = ?').get(req.params.id)) {
+        return res.status(409).json({ error: 'This birthday was changed on another device. Refresh your records before removing it.' });
+      }
+      return res.status(404).json({ error: 'This birthday record could not be found.' });
+    }
     res.status(204).end();
   });
   app.use('/api', (_req, res) => res.status(404).json({ error: 'API endpoint not found.' }));
